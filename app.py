@@ -957,7 +957,18 @@ STRICT INSTRUCTIONS:
 
 def exact_fee_list(question):
     q = question.lower().strip(" ?.!,-")
-    if q not in {"fee", "fees", "all fee", "all fees", "fee structure", "fees structure"}:
+    if q not in {
+    "fee",
+    "fees",
+    "all fee",
+    "all fees",
+    "fee details",
+    "fee detail",
+    "what are the fees",
+    "what are the fee details",
+    "fee structure",
+    "fees structure"
+}:
         return None
 
     fee_path = os.path.join(KNOWLEDGE_FOLDER, "fees.pdf")
