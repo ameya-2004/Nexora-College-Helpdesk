@@ -1,4 +1,19 @@
+# Secrets — never commit your real token
 .env
-venv/
+ 
+# Generated FAISS index (rebuildable from sample_docs/ or your own uploads)
+nexora_kb_store/
+ 
+# Python
 __pycache__/
 *.pyc
+.venv/
+venv/
+ 
+# Streamlit
+.streamlit/secrets.toml
+ 
+# OS/editor cruft
+.DS_Store
+.vscode/
+ 

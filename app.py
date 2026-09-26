@@ -1,1388 +1,682 @@
+
+# streamlit run app.py
+"""
+Nexora College Help Desk
+------------------------
+A Retrieval-Augmented Generation (RAG) chatbot that answers student
+questions about admissions, timetables, fees, and rules — grounded
+strictly in Nexora College's official handbook and circulars.
+ 
+Modules:
+    1. Handbook & Circular Ingestion (PDF + TXT)
+    2. Chunking & Embedding
+    3. Vector Store (FAISS, with optional save/load to disk)
+    4. Retriever
+    5. Student Chat Interface
+"""
+ 
 import os
-import re
+import time
+import tempfile
+from pathlib import Path
+from datetime import datetime
+ 
 import streamlit as st
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
-
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_community.vectorstores import FAISS
-
-
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+ 
+ 
+COLLEGE_NAME = "Nexora Institute of Technology"
+KB_STORE_DIR = "nexora_kb_store"  # local folder where the FAISS index is persisted
+SAMPLE_DOCS_DIR = "sample_docs"  # bundled demo handbook/circulars, shipped next to app.py
+ 
+ 
 # ============================================================
-# 1. PAGE CONFIGURATION
+# 1. Page config + configuration loading
 # ============================================================
-
-st.set_page_config(
-    page_title="Nexora College Helpdesk",
-    page_icon="🎓",
-    layout="wide"
-)
-
-
-# ============================================================
-# 2. LOAD ENVIRONMENT VARIABLES
-# ============================================================
-
+st.set_page_config(page_title=f"{COLLEGE_NAME} Help Desk",
+                   page_icon="🎓",
+                   layout="wide")
+ 
 load_dotenv()
-
-HF_TOKEN = os.getenv("HF_TOKEN")
-
-if not HF_TOKEN:
-    st.error("HF_TOKEN is missing. Please add it to your .env file.")
-    st.stop()
-
-
-# ============================================================
-# 3. CONSTANTS
-# ============================================================
-
-MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
-
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-
-FALLBACK_MESSAGE = (
-    "I don't know based on the uploaded college documents."
-)
-
-KNOWLEDGE_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge")
-
-
-# ============================================================
-# 4. KNOWLEDGE BASE FILES
-# ============================================================
-
-FILES = [
-    "college_handbook.pdf",
-    "admission.pdf",
-    "courses.pdf",
-    "fees.pdf",
-    "attendance.pdf",
-    "examinations.pdf",
-    "hostel.pdf",
-    "library.pdf",
-    "placements.pdf",
-    "circulars.pdf",
-    "contact_directory.pdf",
-    "academic_calendar.pdf",
-    "timetable.pdf",
-    "scholarships.pdf",
-    "student_services.pdf"
-]
-
-
-# ============================================================
-# 5. LOAD PDFs AND CREATE VECTOR DATABASE
-# ============================================================
-
-@st.cache_resource
-def create_vector_database():
-
-    documents = []
-
-    for filename in FILES:
-
-        filepath = os.path.join(
-            KNOWLEDGE_FOLDER,
-            filename
-        )
-
-        if not os.path.exists(filepath):
-
-            st.warning(
-                f"Warning: {filepath} was not found."
-            )
-
-            continue
-
-        try:
-
-            loader = PyPDFLoader(filepath)
-
-            loaded_documents = loader.load()
-
-            # Store source filename in metadata
-            for document in loaded_documents:
-
-                document.metadata["source_file"] = filename
-
-            documents.extend(loaded_documents)
-
-        except Exception as error:
-
-            st.warning(
-                f"Could not load {filename}: {error}"
-            )
-
-
-    if not documents:
-
-        st.error(
-            "No PDF documents were loaded from the knowledge folder."
-        )
-
-        st.stop()
-
-
-    # --------------------------------------------------------
-    # Split documents into chunks
-    # --------------------------------------------------------
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=100
+ 
+ 
+def inject_custom_css():
+    st.markdown(
+        """
+        <style>
+        :root {
+            --nexora-primary: #1E3A8A;
+            --nexora-accent: #D4A017;
+        }
+ 
+        /* Tighten the default top padding */
+        .block-container {
+            padding-top: 1.5rem;
+            max-width: 1200px;
+        }
+ 
+        /* Header banner */
+        .nexora-header {
+            background: linear-gradient(90deg, var(--nexora-primary), #2E4FA8);
+            padding: 1.1rem 1.5rem;
+            border-radius: 14px;
+            color: white;
+            margin-bottom: 1.2rem;
+        }
+        .nexora-header h1 {
+            margin: 0;
+            font-size: 1.5rem;
+            color: white;
+        }
+        .nexora-header p {
+            margin: 0.25rem 0 0 0;
+            font-size: 0.92rem;
+            color: #E7ECFB;
+        }
+ 
+        /* Chat bubbles */
+        [data-testid="stChatMessage"] {
+            border-radius: 14px;
+            padding: 0.4rem 0.2rem;
+        }
+ 
+        /* Sidebar polish */
+        section[data-testid="stSidebar"] {
+            border-right: 1px solid rgba(0,0,0,0.06);
+        }
+        section[data-testid="stSidebar"] h2, 
+        section[data-testid="stSidebar"] h3 {
+            color: var(--nexora-primary);
+        }
+ 
+        /* Keep chat input clean and pinned */
+        [data-testid="stChatInput"] textarea {
+            border-radius: 10px !important;
+        }
+ 
+        .nexora-badge {
+            display: inline-block;
+            background: #EEF2FF;
+            color: var(--nexora-primary);
+            border-radius: 999px;
+            padding: 0.1rem 0.6rem;
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-right: 0.3rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
-
-    chunks = splitter.split_documents(documents)
-
-
-    # --------------------------------------------------------
-    # Create embeddings
-    # --------------------------------------------------------
-
-    embedding = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL
-    )
-
-
-    # --------------------------------------------------------
-    # Create FAISS vector database
-    # --------------------------------------------------------
-
-    vectorstore = FAISS.from_documents(
-        chunks,
-        embedding
-    )
-
-
-    return vectorstore
-
-
-# ============================================================
-# 6. CREATE VECTOR DATABASE
-# ============================================================
-
-with st.spinner("Loading Nexora knowledge base..."):
-
-    vectorstore = create_vector_database()
-
-
-# ============================================================
-# 7. HUGGING FACE CLIENT
-# ============================================================
-
-client = InferenceClient(
-    provider="auto",
-    token=HF_TOKEN
-)
-
-
-# ============================================================
-# 8. SYSTEM PROMPT
-# ============================================================
-
-SYSTEM_PROMPT = f"""
-You are Nexora Institute of Technology's College Helpdesk AI Assistant.
-
-Your job is to answer student questions using ONLY the information
-provided in the retrieved college documents.
-
-The college is fictional and all information comes from the college
-knowledge base.
-
-IMPORTANT RULES:
-
-1. Use only the retrieved documents.
-
-2. Do not invent information.
-
-3. Do not use outside knowledge.
-
-4. If the answer cannot be found in the documents, say exactly:
-
-"{FALLBACK_MESSAGE}"
-
-5. If the question is ambiguous and the documents contain multiple
-possible answers, ask a short clarification question instead of
-choosing an answer arbitrarily.
-
-Example:
-
-Student:
-"What is the college fee?"
-
-Good response:
-"Which program or course are you asking about?"
-
-6. If a follow-up question depends on the previous question, use the
-conversation history to understand what the student means.
-
-Example:
-
-Student:
-"What are the library timings?"
-
-Assistant:
-"The central library is open from 8:00 AM to 8:00 PM on working days."
-
-Student:
-"What about during exams?"
-
-Understand that "during exams" refers to the library.
-
-7. DOCUMENT PRIORITY RULE:
-
-If retrieved documents contain both:
-
-- an older/general rule from a handbook, library document, hostel
-  document, attendance document, etc.
-
-AND
-
-- a later approved circular that specifically changes or temporarily
-  overrides that rule,
-
-use the later applicable circular.
-
-The later circular has priority for that specific situation.
-
-8. Do NOT combine conflicting information from two documents.
-
-Example:
-
-General rule:
-Library closes at 8:00 PM.
-
-Later circular:
-During examination preparation, library remains open until 10:00 PM.
-
-If the student asks about library timings during the examination
-preparation period, answer 10:00 PM.
-
-Do NOT answer 8:00 PM and 10:00 PM together.
-
-9. Pay attention to dates.
-
-If a circular applies only during a specific period, mention that
-period when relevant.
-
-10. Keep answers clear and student-friendly.
-
-11. Do not expose private chain-of-thought or hidden reasoning.
-
-12. You may provide a short explanation when useful, but never reveal
-hidden internal reasoning.
-
-13. Do not tell the student to refer to the uploaded documents.
-
-14. Do not mention phrases such as:
-
-- "uploaded documents"
-- "knowledge base"
-- "Sample/Fictional Knowledge Base"
-- "refer to the document"
-
-unless the student specifically asks where the information came from.
-
-15. Give the answer directly and concisely.
-
-16. Answer ONLY the student's current question.
-
-17. Use only information that directly answers the current question.
-Do not include unrelated information merely because it appears in a
-retrieved document.
-
-18. Do not summarize an entire document when the student asks for one
-specific fact.
-
-19. For admission questions, use only admission requirements and
-admission-process information. Do NOT include attendance rules,
-examination rules, course lists, hostel information, or other handbook
-content unless the student specifically asks for it.
-
-20. For fee questions, use only fee-related information. If the student
-asks for "all fees" or "fee structure", list the fee names and amounts
-from the fee document. Do not add payment schedules, refund policies,
-attendance rules, admission rules, or other unrelated information.
-
-21. Preserve amounts and currency symbols exactly as stated in the
-retrieved college document. Never convert currency or invent a currency
-symbol.
-
-22. Do not describe the fees as "sample" or "fictional" unless the
-student specifically asks about that.
-
-23. Do not tell the student to refer to a document or circular unless
-the student specifically asks for the source.
-
-24. If the student asks only "fee", "fees", "all fee", "all fees", or
-"fee structure", answer with the fee list from fees.pdf. Do not say
-that you do not know, and do not ask which fee unless the question
-clearly refers to a specific program or fee type.
-
-25. Never use the words "sample", "fictional", or "subject to change"
-in an answer unless the student explicitly asks whether the college
-data is sample or fictional.
-
-26. For attendance questions, answer the attendance requirement directly.
-Do not add the phrase "standard sample policy" or unrelated examination
-rules unless specifically asked.
-
-27. Never convert or remove the currency symbol from a monetary amount.
-Use the exact currency symbol and amount shown in the retrieved document.
-
-28. For fee questions, reproduce the fee names and amounts from
-fees.pdf accurately. Do not add commentary about the data being sample,
-fictional, subject to change, or needing to be checked elsewhere.
-
-29. For short valid topic questions such as "fee", "fees", "attendance",
-or "library", answer from the matching college document rather than
-treating the question as unsupported.
-
-FEW-SHOT EXAMPLES:
-
-Example 1:
-
-Question:
-"What is the minimum attendance?"
-
-Answer:
-"The minimum attendance requirement is 75%."
-
-Example 2:
-
-Question:
-"Who should I contact for hostel issues?"
-
-Answer:
-"You should contact the Hostel Office."
-
-Example 3:
-
-Question:
-"What is the college fee?"
-
-Answer:
-"Which program or course are you asking about?"
-
-Example 4:
-
-Question:
-"What are the library timings during examination preparation?"
-
-Context contains:
-
-- General library timing: until 8:00 PM.
-- Later Circular: library remains open until 10:00 PM during
-  examination preparation.
-
-Answer:
-"During the examination preparation period from 20 June to
-5 July 2026, the central library remains open until 10:00 PM
-on working days."
-"""
-
-
-# ============================================================
-# 9. CREATE SEARCH QUERY
-# ============================================================
-
-def normalize_question(question):
-    """Normalize common student typos without changing the meaning."""
-    q = question.strip()
-    replacements = {
-        "timimngs": "timings",
-        "timngs": "timings",
-        "timingss": "timings",
-        "admisson": "admission",
-        "admisison": "admission",
-        "scholorship": "scholarship",
-        "attendence": "attendance",
-        "examinaton": "examination",
-        "helpdest": "helpdesk",
-        "helpdeskk": "helpdesk",
-        "help desk": "helpdesk",
-        "student help dest": "student helpdesk",
-    }
-    for wrong, right in replacements.items():
-        q = re.sub(r"\b" + re.escape(wrong) + r"\b", right, q, flags=re.IGNORECASE)
-    return q
-
-
-def get_previous_user_question():
-    """Return the last user question before the current one."""
-    users = [m["content"].strip() for m in st.session_state.messages if m["role"] == "user"]
-    if len(users) >= 2:
-        return users[-2]
-    return None
-
-
-def create_search_query(question):
-    current_question = normalize_question(question)
-    current_lower = current_question.lower()
-    previous_question = get_previous_user_question()
-
-    # Resolve short/contextual follow-ups BEFORE checking explicit topics.
-    # Example: after "What are the library timings?", "timimngs during exams"
-    # must be interpreted as a library question, not as a generic exam query.
-    follow_up_phrases = [
-        "what about", "how about", "and during", "during",
-        "what is the amount", "how much", "how many", "when",
-        "where", "who should", "who do", "how do i", "can i",
-        "is it", "does it"
-    ]
-    short_follow_up = len(current_question.split()) <= 6
-    previous_lower = previous_question.lower() if previous_question else ""
-    previous_topic = any(topic in previous_lower for topic in [
-        "library", "hostel", "fee", "fees", "admission", "scholarship",
-        "placement", "attendance", "course", "timetable", "exam",
-        "examination", "student service"
-    ])
-
-    if previous_question and (any(p in current_lower for p in follow_up_phrases) or (short_follow_up and previous_topic)):
-        # A clearly named new object starts a new question.
-        explicit_new_object = any(topic in current_lower for topic in [
-            "fee", "fees", "admission", "admissions", "course", "courses",
-            "scholarship", "scholarships", "placement", "placements", "hostel",
-            "attendance", "library", "timetable", "student service"
-        ])
-
-        # Special case: "timings during exams" after a library question.
-        if (short_follow_up and "library" in previous_lower and
-                ("exam" in current_lower or "timing" in current_lower) and
-                "library" not in current_lower):
-            return normalize_question(previous_question) + " " + current_question
-
-        if not explicit_new_object:
-            return normalize_question(previous_question) + " " + current_question
-
-    # Normalize very short fee questions so they always retrieve the complete
-    # fee document instead of relying on semantic similarity.
-    fee_question = current_lower.strip(" ?.!,-")
-    if fee_question in {"fee", "fees", "all fee", "all fees", "fee structure", "fees structure"}:
-        return (
-            "complete fee structure tuition fee university academic charges "
-            "laboratory technology fee library student services fee "
-            "examination fee hostel accommodation hostel mess advance"
-        )
-
-    explicit_topics = [
-        "fee", "fees", "tuition", "cost", "charge", "charges",
-        "admission", "admissions", "eligibility", "apply",
-        "course", "courses", "branch", "branches", "program", "programs", "degree",
-        "scholarship", "scholarships", "placement", "placements", "recruitment", "career", "job",
-        "hostel", "warden", "mess", "accommodation", "attendance", "absent", "absence",
-        "library", "librarian", "exam", "examination", "exams", "hall ticket",
-        "timetable", "schedule", "academic calendar", "semester date", "academic year",
-        "contact", "phone", "email", "number", "office", "student service", "student services",
-        "counselling", "transport", "id card"
-    ]
-    if any(topic in current_lower for topic in explicit_topics):
-        return current_question
-
-    return current_question
-
-
-# ============================================================
-# 10. RETRIEVE DOCUMENTS
-# ============================================================
-
-def retrieve_documents(question):
-
-    current_question = question.strip()
-    question_lower = current_question.lower()
-
+ 
+ 
+def get_config_value(key, default=None):
+    """Read from environment (.env, local) or st.secrets (Streamlit Cloud)."""
+    value = os.getenv(key)
+    if value:
+        return value
     try:
-
-        # ----------------------------------------------------
-        # FEE QUESTIONS — HARD ROUTE TO fees.pdf CHUNKS
-        # ----------------------------------------------------
-        # This check happens BEFORE search-query creation.
-        # Therefore "fee", "fees", "all fee", "all fees",
-        # "fee structure", etc. can never fail because of
-        # semantic similarity.
-        # ----------------------------------------------------
-
-        fee_words = [
-            "fee",
-            "fees",
-            "tuition",
-            "cost",
-            "charge",
-            "charges"
-        ]
-
-        is_fee_question = any(
-            word in question_lower
-            for word in fee_words
-        )
-
-        if is_fee_question:
-
-            # Load fees.pdf directly for every fee question.
-            # This completely bypasses FAISS similarity and metadata
-            # filtering, so "fee", "fees", "all fee", and "all fees"
-            # are handled deterministically.
-            fee_path = os.path.join(
-                KNOWLEDGE_FOLDER,
-                "fees.pdf"
-            )
-
-            if not os.path.isfile(fee_path):
-
-                st.error(
-                    f"Fee document not found: {os.path.abspath(fee_path)}"
-                )
-
-                return [], current_question
-
-            try:
-
-                fee_documents = PyPDFLoader(
-                    fee_path
-                ).load()
-
-                for document in fee_documents:
-                    document.metadata["source_file"] = "fees.pdf"
-
-                if fee_documents:
-                    return fee_documents, current_question
-
-                st.error(
-                    "fees.pdf was loaded but contains no readable text."
-                )
-
-                return [], current_question
-
-            except Exception as error:
-
-                st.error(
-                    f"Could not read fees.pdf: {error}"
-                )
-
-                return [], current_question
-
-
-        # ----------------------------------------------------
-        # CREATE SEARCH QUERY FOR NON-FEE QUESTIONS
-        # ----------------------------------------------------
-
-        search_query = create_search_query(
-            current_question
-        )
-
-        query_lower = search_query.lower()
-
-
-        # ----------------------------------------------------
-        # LIBRARY + EXAMINATION SPECIAL CASE
-        # ----------------------------------------------------
-
-        library_related = (
-            "library" in query_lower
-        )
-
-        exam_related = (
-            "exam" in query_lower
-            or "examination" in query_lower
-            or "exams" in query_lower
-        )
-
-        if library_related and exam_related:
-
-            circular_documents = []
-
-            for document in vectorstore.docstore._dict.values():
-
-                source = document.metadata.get(
-                    "source_file",
-                    ""
-                ).lower()
-
-                content = document.page_content.lower()
-
-                if (
-                    source == "circulars.pdf"
-                    and (
-                        "library timing update" in content
-                        or "10:00 pm" in content
-                    )
-                ):
-
-                    circular_documents.append(
-                        document
-                    )
-
-            if circular_documents:
-
-                return circular_documents, search_query
-
-
-        # ----------------------------------------------------
-        # DOCUMENT CATEGORY
-        # ----------------------------------------------------
-
-        source_files = None
-
-
-        if (
-            "hostel" in query_lower
-            or "warden" in query_lower
-            or "mess" in query_lower
-            or "accommodation" in query_lower
-        ):
-
-            source_files = [
-                "hostel.pdf",
-                "contact_directory.pdf",
-                "circulars.pdf"
-            ]
-
-
-        elif (
-            "library" in query_lower
-            or "librarian" in query_lower
-        ):
-
-            source_files = [
-                "library.pdf"
-            ]
-
-
-        elif (
-            "admission" in query_lower
-            or "admissions" in query_lower
-            or "eligibility" in query_lower
-            or "apply" in query_lower
-        ):
-
-            source_files = [
-                "admission.pdf"
-            ]
-
-
-        elif (
-            "scholarship" in query_lower
-            or "scholarships" in query_lower
-        ):
-
-            source_files = [
-                "scholarships.pdf",
-                "student_services.pdf"
-            ]
-
-
-        elif (
-            "placement" in query_lower
-            or "placements" in query_lower
-            or "recruitment" in query_lower
-            or "career" in query_lower
-            or "job" in query_lower
-        ):
-
-            source_files = [
-                "placements.pdf",
-                "circulars.pdf"
-            ]
-
-
-        elif (
-            "attendance" in query_lower
-            or "absent" in query_lower
-            or "absence" in query_lower
-        ):
-
-            source_files = [
-                "attendance.pdf",
-                "circulars.pdf"
-            ]
-
-
-        elif (
-            "exam" in query_lower
-            or "examination" in query_lower
-            or "hall ticket" in query_lower
-        ):
-
-            source_files = [
-                "examinations.pdf",
-                "circulars.pdf"
-            ]
-
-
-        elif (
-            "course" in query_lower
-            or "courses" in query_lower
-            or "branch" in query_lower
-            or "branches" in query_lower
-            or "program" in query_lower
-            or "programs" in query_lower
-            or "degree" in query_lower
-        ):
-
-            source_files = [
-                "courses.pdf",
-                "college_handbook.pdf"
-            ]
-
-
-        elif (
-            "contact" in query_lower
-            or "phone" in query_lower
-            or "email" in query_lower
-            or "number" in query_lower
-            or "office" in query_lower
-        ):
-
-            source_files = [
-                "contact_directory.pdf",
-                "student_services.pdf"
-            ]
-
-
-        elif (
-            "timetable" in query_lower
-            or "schedule" in query_lower
-            or "class timing" in query_lower
-        ):
-
-            source_files = [
-                "timetable.pdf",
-                "academic_calendar.pdf"
-            ]
-
-
-        elif (
-            "academic calendar" in query_lower
-            or "semester date" in query_lower
-            or "academic year" in query_lower
-        ):
-
-            source_files = [
-                "academic_calendar.pdf",
-                "circulars.pdf"
-            ]
-
-
-        elif (
-            "student service" in query_lower
-            or "student services" in query_lower
-            or "counselling" in query_lower
-            or "transport" in query_lower
-            or "id card" in query_lower
-        ):
-
-            source_files = [
-                "student_services.pdf",
-                "contact_directory.pdf"
-            ]
-
-
-        # ----------------------------------------------------
-        # CATEGORY RETRIEVAL
-        # ----------------------------------------------------
-
-        if source_files:
-
-            candidates = vectorstore.similarity_search(
-                search_query,
-                k=30
-            )
-
-            filtered_documents = []
-
-            for document in candidates:
-
-                source = document.metadata.get(
-                    "source_file",
-                    ""
-                )
-
-                if source in source_files:
-
-                    filtered_documents.append(
-                        document
-                    )
-
-            # Guaranteed category fallback from the already
-            # loaded vectorstore.
-            if not filtered_documents:
-
-                for document in vectorstore.docstore._dict.values():
-
-                    source = document.metadata.get(
-                        "source_file",
-                        ""
-                    )
-
-                    if source in source_files:
-
-                        filtered_documents.append(
-                            document
-                        )
-
-            return filtered_documents[:12], search_query
-
-
-        # ----------------------------------------------------
-        # GENERAL QUESTIONS
-        # ----------------------------------------------------
-
-        scored_documents = (
-            vectorstore
-            .similarity_search_with_relevance_scores(
-                search_query,
-                k=15
-            )
-        )
-
-        MIN_RELEVANCE_SCORE = 0.15
-
-        relevant_documents = [
-            document
-            for document, score in scored_documents
-            if score >= MIN_RELEVANCE_SCORE
-        ]
-
-        return relevant_documents[:8], search_query
-
-
-    except Exception as error:
-
-        st.error(
-            f"Document retrieval error: {error}"
-        )
-
-        return [], current_question
-
-
-# ============================================================
-# 11. CONVERSATION HISTORY
-# ============================================================
-
-# Previous generated answers are intentionally not sent back to the model.
-# Follow-up context is handled only by retrieval.
-
-
-# ============================================================
-# 12. CONVERT HF STREAM CHUNKS INTO TEXT
-# ============================================================
-
-def generate_response(response_stream):
-
-    for chunk in response_stream:
-
-        # Ignore chunks without choices
-
-        if not chunk.choices:
-            continue
-
-
-        # Get the text from the streaming chunk
-
-        content = chunk.choices[0].delta.content
-
-
-        # Yield only actual text
-
-        if content:
-
-            yield content
-
-
-# ============================================================
-# 13. ASK AI WITH STREAMING
-# ============================================================
-
-def ask_ai(question, context):
-
-    user_prompt = f"""
-RETRIEVED COLLEGE DOCUMENTS:
-
-{context}
-
-CURRENT STUDENT QUESTION:
-
-{question}
-
-STRICT INSTRUCTIONS:
-- Answer ONLY the current question.
-- Use ONLY facts explicitly present in the retrieved documents above.
-- Do not use previous answers or outside knowledge.
-- Do not invent dates, amounts, deadlines, policies, schedules,
-  conditions, contacts, or explanations.
-- If the requested information is not explicitly present, answer exactly:
-  "{FALLBACK_MESSAGE}"
-- If the question asks for fees, list only the fee information relevant
-  to the question. Do not add payment/refund information unless asked.
-- Preserve every amount, date, percentage, and time exactly as stated.
-- For library questions during examination preparation, use the later
-  applicable circular instead of the older general library timing.
-- Keep the answer concise.
-"""
-
-    try:
-        response_stream = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt}
-            ],
-            max_tokens=250,
-            temperature=0.0,
-            stream=True
-        )
-
-        for chunk in response_stream:
-            if not chunk.choices:
-                continue
-            content = chunk.choices[0].delta.content
-            if content:
-                yield content
-
-    except Exception as error:
-        error_message = str(error).lower()
-        if "rate" in error_message or "429" in error_message:
-            yield "The AI service is temporarily busy. Please try again in a moment."
-        elif "timeout" in error_message or "connection" in error_message:
-            yield "I could not connect to the AI service. Please try again."
-        else:
-            yield "Sorry, I encountered an error while processing your question."
-
-
-# ============================================================
-# 14. EXACT FEE LIST FOR A GENERAL FEES QUESTION
-# ============================================================
-
-def exact_fee_list(question):
-    q = question.lower().strip(" ?.!,-")
-    if q not in {
-    "fee",
-    "fees",
-    "all fee",
-    "all fees",
-    "fee details",
-    "fee detail",
-    "what are the fees",
-    "what are the fee details",
-    "fee structure",
-    "fees structure"
-}:
-        return None
-
-    fee_path = os.path.join(KNOWLEDGE_FOLDER, "fees.pdf")
-    try:
-        docs = PyPDFLoader(fee_path).load()
+        return st.secrets[key]
     except Exception:
-        return None
-
-    text = "\n".join(doc.page_content for doc in docs)
-    wanted = [
-        "B.Tech Tuition Fee",
-        "University/Academic Charges",
-        "Laboratory and Technology Fee",
-        "Library and Student Services Fee",
-        "Examination Fee",
-        "Hostel Accommodation",
-        "Hostel Mess Advance"
-    ]
-
-    lines = []
-    for name in wanted:
-        pattern = re.compile(
-            re.escape(name) + r"\s*[\n: -]*[■₹$]?\s*([0-9][0-9,]*)\s*(per academic year|per semester|per year)",
-            re.IGNORECASE
-        )
-        match = pattern.search(text)
-        if match:
-            lines.append(f"- {name}: ₹{match.group(1)} {match.group(2)}")
-
-    if not lines:
-        return None
-
-    return "The fees for Nexora Institute of Technology include:\n\n" + "\n".join(lines)
-
-
-# ============================================================
-# 14. GET SOURCE DOCUMENTS
-# ============================================================
-
-def get_sources(documents):
-
-    sources = []
-
-    for document in documents:
-
-        source = document.metadata.get(
-            "source_file",
-            "Unknown document"
-        )
-
-
-        if source not in sources:
-
-            sources.append(source)
-
-
-    return sources
-
-
-def exact_common_answer(question):
-    """Deterministic answers for high-confidence, frequently asked facts."""
-    q = normalize_question(question).lower().strip(" ?.!,-")
-    search_q = create_search_query(question).lower()
-
-    # Library timings — general rule.
-    if "library" in q and any(x in q for x in ["timing", "timings", "hours", "open", "closing", "close"]):
-        if "exam" in q or "examination" in q or "exam" in search_q or "examination" in search_q:
-            return (
-                "During the examination preparation period from 20 June to 5 July 2026, "
-                "the central library will remain open until 10:00 PM on working days."
-            ), "circulars.pdf"
-        return (
-            "The central library is open from 8:00 AM to 8:00 PM Monday through Friday "
-            "and from 9:00 AM to 1:00 PM on Saturdays. The library remains closed on "
-            "Sundays and declared institute holidays unless a special notice states otherwise."
-        ), "library.pdf"
-
-    # A short follow-up such as "timings during exams" after a library question.
-    if ("library" in search_q and ("exam" in search_q or "examination" in search_q)
-            and any(x in q for x in ["timing", "timings", "hours", "open", "close", "closing", "during"])):
-        return (
-            "During the examination preparation period from 20 June to 5 July 2026, "
-            "the central library will remain open until 10:00 PM on working days."
-        ), "circulars.pdf"
-
-    # Attendance — keep a short direct answer for the standard question.
-    if q in {"attendance", "minimum attendance", "what is the minimum attendance", "what is the attendance requirement"}:
-        return "The minimum attendance requirement at Nexora Institute of Technology is 75 percent.", "attendance.pdf"
-
-    # Hostel accommodation fee — deterministic so the LLM cannot change
-    # the currency or amount (for example, to an incorrect currency).
-    hostel_fee_phrases = {
-        "hostel fee",
-        "hostel fees",
-        "what is the hostel fee",
-        "what are the hostel fees",
-        "how much is hostel",
-        "how much is the hostel fee",
-        "hostel accommodation fee",
-        "what is the hostel accommodation fee",
-        "hostel accommodation fees"
-    }
-    if q in hostel_fee_phrases or ("hostel" in q and "fee" in q):
-        return "The hostel accommodation fee at Nexora Institute of Technology is ₹60,000 per year.", "fees.pdf"
-
-    # Contact directory — deterministic answers for named offices so
-    # contact information is never lost to semantic retrieval or LLM
-    # generation. These values come from contact_directory.pdf.
-    contacts = {
-        "student helpdesk": ("Student Helpdesk", "+91 80000 10008", "helpdesk@nexora.edu"),
-        "admissions": ("Admissions", "+91 80000 10001", "admissions@nexora.edu"),
-        "admission": ("Admissions", "+91 80000 10001", "admissions@nexora.edu"),
-        "accounts": ("Accounts", "+91 80000 10002", "accounts@nexora.edu"),
-        "examinations": ("Examinations", "+91 80000 10003", "exams@nexora.edu"),
-        "examination": ("Examinations", "+91 80000 10003", "exams@nexora.edu"),
-        "exams": ("Examinations", "+91 80000 10003", "exams@nexora.edu"),
-        "training placement": ("Training & Placement", "+91 80000 10004", "placements@nexora.edu"),
-        "placement": ("Training & Placement", "+91 80000 10004", "placements@nexora.edu"),
-        "placements": ("Training & Placement", "+91 80000 10004", "placements@nexora.edu"),
-        "hostel": ("Hostel", "+91 80000 10005", "hostel@nexora.edu"),
-        "library": ("Library", "+91 80000 10006", "library@nexora.edu"),
-        "academic office": ("Academic Office", "+91 80000 10007", "academics@nexora.edu"),
-        "academics": ("Academic Office", "+91 80000 10007", "academics@nexora.edu"),
-        "it support": ("IT Support", "+91 80000 10009", "itsupport@nexora.edu"),
-        "it": ("IT Support", "+91 80000 10009", "itsupport@nexora.edu"),
-        "principal": ("Principal", "+91 80000 10010", "principal@nexora.edu")
-    }
-
-    contact_words = ("contact", "phone", "number", "email", "helpdesk", "office")
-    if any(word in q for word in contact_words):
-        # Return the complete directory when the user asks generally.
-        if q in {"contact", "contacts", "contact details", "contact information", "all contacts", "contact numbers"}:
-            rows = [
-                contacts["student helpdesk"], contacts["admissions"], contacts["accounts"],
-                contacts["examinations"], contacts["training placement"], contacts["hostel"],
-                contacts["library"], contacts["academic office"], contacts["it support"], contacts["principal"]
-            ]
-            answer = "Available contact details:\n\n" + "\n".join(
-                f"- {name}: {phone} | {email}" for name, phone, email in rows
-            )
-            return answer, "contact_directory.pdf"
-
-        # Match the most specific office first.
-        aliases = [
-            ("student helpdesk", "student helpdesk"),
-            ("helpdesk", "student helpdesk"),
-            ("admissions", "admissions"),
-            ("admission", "admission"),
-            ("accounts", "accounts"),
-            ("examination", "examinations"),
-            ("exams", "exams"),
-            ("training", "training placement"),
-            ("placement", "placement"),
-            ("placements", "placements"),
-            ("hostel", "hostel"),
-            ("library", "library"),
-            ("academic office", "academic office"),
-            ("academics", "academics"),
-            ("it support", "it support"),
-            ("principal", "principal")
-        ]
-        for phrase, key in aliases:
-            if phrase in q:
-                name, phone, email = contacts[key]
-                return f"**{name} contact:** {phone}\n**Email:** {email}", "contact_directory.pdf"
-
-    return None, None
-
-
-# ============================================================
-# 15. SESSION STATE
-# ============================================================
-
-if "messages" not in st.session_state:
-
-    st.session_state.messages = []
-
-
-# ============================================================
-# 16. HEADER
-# ============================================================
-
-st.title("🎓 Nexora College Helpdesk")
-
-st.write(
-    "Ask questions about admissions, courses, fees, hostel, "
-    "library, examinations, placements, scholarships, "
-    "attendance and student services."
-)
-
-
-# ============================================================
-# 17. SIDEBAR
-# ============================================================
-
-with st.sidebar:
-
-    st.header("🎓 Nexora Helpdesk")
-
-    st.write(
-        "RAG-Based AI Assistant"
+        return default
+ 
+ 
+HF_TOKEN = get_config_value("HF_TOKEN")
+MODEL_NAME = get_config_value("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
+ADMIN_PASSCODE = get_config_value("ADMIN_PASSCODE", "")  # optional; blank = no lock
+ 
+if not HF_TOKEN:
+    st.error(
+        "HF_TOKEN is missing. Add it to a local `.env` file, or on Streamlit "
+        "Community Cloud go to **Settings -> Secrets** and add:\n\n"
+        "```\nHF_TOKEN = \"hf_your_token\"\n```"
     )
-
-    st.divider()
-
-    st.subheader("Knowledge Base")
-
-    st.write(
-        f"{len(FILES)} college documents loaded"
-    )
-
-    st.divider()
-
-    st.subheader("Example Questions")
-
-    st.write(
-        "• What is the minimum attendance?"
-    )
-
-    st.write(
-        "• What are the library timings?"
-    )
-
-    st.write(
-        "• What are the library timings during exams?"
-    )
-
-    st.write(
-        "• What is the hostel fee?"
-    )
-
-    st.write(
-        "• Who should I contact for hostel issues?"
-    )
-
-    st.write(
-        "• What are the admission requirements?"
-    )
-
-    st.write(
-        "• What scholarships are available?"
-    )
-
-    st.write(
-        "• What are the placement services?"
-    )
-
-    st.divider()
-
-    if st.button(
-        "🗑️ Clear Conversation",
-        use_container_width=True
-    ):
-
-        st.session_state.messages = []
-
-        st.rerun()
-
-
+    st.stop()
+ 
+ 
 # ============================================================
-# 18. DISPLAY PREVIOUS MESSAGES
+# 2. Create clients/models once when the app starts
 # ============================================================
-
-for message in st.session_state.messages:
-
-    role = message["role"]
-
-
-    # --------------------------------------------------------
-    # User message
-    # --------------------------------------------------------
-
-    if role == "user":
-
-        with st.chat_message("user"):
-
-            st.write(
-                message["content"]
-            )
-
-
-    # --------------------------------------------------------
-    # Assistant message
-    # --------------------------------------------------------
-
-    elif role == "assistant":
-
-        with st.chat_message("assistant"):
-
-            st.write(
-                message["content"]
-            )
-
-
-            # Display sources
-
-            if message.get("sources"):
-
-                with st.expander(
-                    "📚 Sources used"
-                ):
-
-                    for source in message["sources"]:
-
-                        st.write(
-                            f"• {source}"
-                        )
-
-
-# ============================================================
-# 19. CHAT INPUT
-# ============================================================
-
-question = st.chat_input(
-    "Ask Nexora College Helpdesk..."
-)
-
-
-# ============================================================
-# 20. PROCESS QUESTION
-# ============================================================
-
-if question:
-
-    # --------------------------------------------------------
-    # Display user question
-    # --------------------------------------------------------
-
-    with st.chat_message("user"):
-
-        st.write(question)
-
-
-    # Save user message
-
-    st.session_state.messages.append(
-        {
-            "role": "user",
-            "content": question
-        }
+@st.cache_resource(show_spinner=False)
+def get_llm_client():
+    return InferenceClient(provider="auto", token=HF_TOKEN)
+ 
+ 
+@st.cache_resource(show_spinner=False)
+def get_embedding_model():
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
     )
-
-
-    # --------------------------------------------------------
-    # Deterministic high-confidence answers first
-    # --------------------------------------------------------
-
-    common_answer, common_source = exact_common_answer(question)
-    exact_answer = exact_fee_list(question)
-
-    if common_answer is not None:
-
-        answer = common_answer
-        sources = [common_source]
-
-        with st.chat_message("assistant"):
-            st.write(answer)
-            with st.expander("📚 Sources used"):
-                st.write(f"• {common_source}")
-
-    elif exact_answer is not None:
-
-        answer = exact_answer
-        sources = ["fees.pdf"]
-
-        with st.chat_message("assistant"):
-            st.write(answer)
-            with st.expander("📚 Sources used"):
-                st.write("• fees.pdf")
-
+ 
+ 
+client = get_llm_client()
+embedding_model = get_embedding_model()
+ 
+ 
+# ============================================================
+# 3. Session state
+# ============================================================
+DEFAULTS = {
+    "retriever": None,
+    "chat_history": [],
+    "status_message": "No knowledge base loaded yet. Ask an admin to upload the handbook and circulars.",
+    "sources_text": "",
+    "doc_registry": [],       # list of {"name":..., "category":..., "pages":...}
+    "kb_built_at": None,
+    "admin_unlocked": ADMIN_PASSCODE == "",  # if no passcode set, admin tab is open
+}
+for key, value in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+ 
+ 
+# ============================================================
+# 4. Build the vector database from uploaded documents
+# ============================================================
+def _load_single_file(file_path: Path, category: str, original_name: str):
+    """Load one PDF or TXT file into LangChain Document objects, tagged with metadata."""
+    suffix = file_path.suffix.lower()
+ 
+    if suffix == ".pdf":
+        loader = PyPDFLoader(str(file_path))
+        pages = loader.load()
+    elif suffix in (".txt", ".md"):
+        loader = TextLoader(str(file_path), encoding="utf-8")
+        pages = loader.load()
     else:
-        # Retrieve only when the question is not a deterministic FAQ.
-        with st.spinner("Searching college documents..."):
-            documents, search_query = retrieve_documents(question)
-
-        if not documents:
-            answer = FALLBACK_MESSAGE
-            sources = []
-
-            with st.chat_message("assistant"):
-                st.write(answer)
-
-        else:
-
-            context_parts = []
-
-            for document in documents:
-                source = document.metadata.get("source_file", "Unknown document")
-                content = document.page_content
-                context_parts.append(f"SOURCE: {source}\n\nCONTENT:\n{content}")
-
-            context = "\n\n".join(context_parts)
-            sources = get_sources(documents)
-
-            with st.chat_message("assistant"):
-                with st.spinner("Preparing answer..."):
-                    answer = st.write_stream(ask_ai(question, context))
-
-                if not answer:
-                    answer = FALLBACK_MESSAGE
-
-                if sources:
-                    with st.expander("📚 Sources used"):
-                        for source in sources:
-                            st.write(f"• {source}")
-
-
-    # SAVE ASSISTANT RESPONSE
-    # ========================================================
-
-    st.session_state.messages.append(
-        {
-            "role": "assistant",
-            "content": answer,
-            "sources": sources
-        }
+        return []
+ 
+    for page in pages:
+        page.metadata["source_name"] = original_name
+        page.metadata["category"] = category
+ 
+    return pages
+ 
+ 
+def _finalize_knowledge_base(documents, new_registry_entries, append, progress_bar, source_label="uploaded files"):
+    """
+    Shared tail-end pipeline: split into chunks -> embed -> build/merge FAISS
+    -> create retriever -> update session state and status message.
+    Used by both the upload-based builder and the bundled sample-doc loader.
+    """
+    if not documents:
+        st.session_state.status_message = f"No readable content was found in the {source_label}."
+        return
+ 
+    progress_bar.progress(0.45, text="Splitting documents into chunks")
+ 
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=150,
+        length_function=len,
     )
+    chunks = splitter.split_documents(documents)
+ 
+    if not chunks:
+        st.session_state.status_message = f"The {source_label} were loaded, but no text chunks were created."
+        return
+ 
+    progress_bar.progress(0.60, text="Creating embeddings")
+ 
+    new_store = FAISS.from_documents(documents=chunks, embedding=embedding_model)
+ 
+    if append and st.session_state.get("_vector_store") is not None:
+        st.session_state["_vector_store"].merge_from(new_store)
+        vector_store = st.session_state["_vector_store"]
+        st.session_state.doc_registry.extend(new_registry_entries)
+    else:
+        vector_store = new_store
+        st.session_state.doc_registry = new_registry_entries
+ 
+    st.session_state["_vector_store"] = vector_store
+ 
+    retriever = vector_store.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 5},
+    )
+ 
+    st.session_state.retriever = retriever
+    if not append:
+        st.session_state.chat_history = []
+    st.session_state.sources_text = ""
+    st.session_state.kb_built_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+ 
+    progress_bar.progress(1.0, text="Knowledge base ready")
+ 
+    total_docs = len(st.session_state.doc_registry)
+    total_pages = sum(entry["pages"] for entry in st.session_state.doc_registry)
+    st.session_state.status_message = (
+        f"Knowledge base ready for {COLLEGE_NAME}.\n\n"
+        f"Documents indexed: {total_docs}\n"
+        f"Pages/sections loaded: {total_pages}\n"
+        f"Chunks in this build: {len(chunks)}\n"
+        f"Last updated: {st.session_state.kb_built_at}"
+    )
+ 
+ 
+def build_knowledge_base(handbook_files, circular_files, other_files, append=False):
+    """
+    Load handbook, circular, and other supporting documents (as uploaded by
+    the admin) -> split into chunks -> create embeddings -> build (or
+    extend) a FAISS vector store -> create a retriever.
+    """
+    grouped = [
+        ("Handbook", handbook_files or []),
+        ("Circular", circular_files or []),
+        ("Other", other_files or []),
+    ]
+ 
+    total_files = sum(len(files) for _, files in grouped)
+    if total_files == 0:
+        st.session_state.status_message = "Please upload at least one file (handbook, circular, or other)."
+        return
+ 
+    progress_bar = st.progress(0, text="Loading documents")
+ 
+    try:
+        documents = []
+        new_registry_entries = []
+        processed = 0
+ 
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for category, files in grouped:
+                for uploaded_file in files:
+                    tmp_path = Path(tmp_dir) / uploaded_file.name
+                    with open(tmp_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+ 
+                    loaded_pages = _load_single_file(tmp_path, category, uploaded_file.name)
+                    documents.extend(loaded_pages)
+ 
+                    new_registry_entries.append({
+                        "name": uploaded_file.name,
+                        "category": category,
+                        "pages": len(loaded_pages),
+                    })
+ 
+                    processed += 1
+                    progress_bar.progress(
+                        min(0.35, 0.05 + (processed / max(total_files, 1)) * 0.30),
+                        text=f"Loaded {uploaded_file.name} ({category})",
+                    )
+ 
+            _finalize_knowledge_base(documents, new_registry_entries, append, progress_bar,
+                                      source_label="uploaded files")
+ 
+    except Exception as error:
+        st.session_state.status_message = f"Could not build the knowledge base.\n\nError: {error}"
+ 
+    finally:
+        progress_bar.empty()
+ 
+ 
+def load_sample_knowledge_base(append=False):
+    """
+    Build the knowledge base from the bundled sample Nexora Institute of
+    Technology handbook, circulars, and reference documents shipped in the
+    sample_docs/ folder next to this app.
+    Lets the app work end-to-end for a demo without needing any uploads.
+    """
+    sample_root = Path(SAMPLE_DOCS_DIR)
+    category_folders = [
+        ("Handbook", sample_root / "handbook"),
+        ("Circular", sample_root / "circulars"),
+        ("Other", sample_root / "other"),
+    ]
+ 
+    file_specs = []
+    for category, folder in category_folders:
+        if not folder.exists():
+            continue
+        for file_path in sorted(folder.iterdir()):
+            if file_path.suffix.lower() in (".pdf", ".txt", ".md"):
+                file_specs.append((file_path, category))
+ 
+    if not file_specs:
+        st.session_state.status_message = (
+            f"No bundled sample documents were found under '{SAMPLE_DOCS_DIR}/'. "
+            "Make sure the sample_docs folder is deployed alongside app.py."
+        )
+        return
+ 
+    progress_bar = st.progress(0, text="Loading bundled Nexora sample documents")
+ 
+    try:
+        documents = []
+        new_registry_entries = []
+ 
+        for index, (file_path, category) in enumerate(file_specs, start=1):
+            loaded_pages = _load_single_file(file_path, category, file_path.name)
+            documents.extend(loaded_pages)
+ 
+            new_registry_entries.append({
+                "name": file_path.name,
+                "category": category,
+                "pages": len(loaded_pages),
+            })
+ 
+            progress_bar.progress(
+                min(0.35, 0.05 + (index / max(len(file_specs), 1)) * 0.30),
+                text=f"Loaded {file_path.name} ({category})",
+            )
+ 
+        _finalize_knowledge_base(documents, new_registry_entries, append, progress_bar,
+                                  source_label="bundled sample documents")
+ 
+    except Exception as error:
+        st.session_state.status_message = f"Could not load the sample knowledge base.\n\nError: {error}"
+ 
+    finally:
+        progress_bar.empty()
+ 
+ 
+def save_knowledge_base():
+    vector_store = st.session_state.get("_vector_store")
+    if vector_store is None:
+        st.session_state.status_message = "There is no knowledge base in memory to save."
+        return
+    try:
+        vector_store.save_local(KB_STORE_DIR)
+        st.session_state.status_message = (
+            f"Knowledge base saved to disk at '{KB_STORE_DIR}'. "
+            "It will auto-load next time the app starts."
+        )
+    except Exception as error:
+        st.session_state.status_message = f"Could not save the knowledge base.\n\nError: {error}"
+ 
+ 
+def load_knowledge_base_from_disk():
+    if not Path(KB_STORE_DIR).exists():
+        st.session_state.status_message = "No saved knowledge base was found on disk yet."
+        return
+    try:
+        vector_store = FAISS.load_local(
+            KB_STORE_DIR, embedding_model, allow_dangerous_deserialization=True
+        )
+        st.session_state["_vector_store"] = vector_store
+        st.session_state.retriever = vector_store.as_retriever(
+            search_type="similarity", search_kwargs={"k": 5}
+        )
+        st.session_state.status_message = f"Loaded saved knowledge base for {COLLEGE_NAME} from disk."
+    except Exception as error:
+        st.session_state.status_message = f"Could not load the saved knowledge base.\n\nError: {error}"
+ 
+ 
+def clear_session():
+    """Remove the vector database and clear the interface."""
+    st.session_state.retriever = None
+    st.session_state["_vector_store"] = None
+    st.session_state.chat_history = []
+    st.session_state.status_message = "No knowledge base loaded yet. Ask an admin to upload the handbook and circulars."
+    st.session_state.sources_text = ""
+    st.session_state.doc_registry = []
+    st.session_state.kb_built_at = None
+ 
+ 
+# ============================================================
+# 5. Generate an answer using the retrieved document context
+# ============================================================
+def generate_answer(question, context, attempts=3):
+    """
+    Send the question and retrieved context to the hosted LLM.
+    Retry temporary API failures before returning an error message.
+    """
+    system_prompt = (
+        f"You are the official AI Help Desk assistant for {COLLEGE_NAME}. "
+        "You answer student questions about admissions, timetables, fees, and rules "
+        "using ONLY the supplied document context, which comes from the college's "
+        "official handbook and circulars. "
+        "Do not use outside knowledge, and do not guess or make up policies, dates, or amounts. "
+        "If the answer is not clearly present in the context, respond exactly with: "
+        f"\"I don't know based on the {COLLEGE_NAME} handbook and circulars currently available. "
+        "Please check with the administration office.\" "
+        "When the context includes a date, deadline, or fee amount, quote it exactly as written. "
+        "If circulars and the handbook appear to conflict, mention the conflict and note that the "
+        "more recent circular normally takes precedence, and advise the student to confirm with the office. "
+        "Keep answers clear, concise, and student-friendly. "
+        "After the answer, do not repeat the raw source tags — the app will display sources separately."
+    )
+ 
+    user_prompt = f"""
+DOCUMENT CONTEXT:
+{context}
+ 
+STUDENT QUESTION:
+{question}
+ 
+ANSWER:
+""".strip()
+ 
+    for attempt in range(1, attempts + 1):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=400,
+                temperature=0.2,
+            )
+ 
+            answer = response.choices[0].message.content
+ 
+            if not answer:
+                raise ValueError("The model returned an empty response.")
+ 
+            return answer.strip()
+ 
+        except Exception as error:
+            if attempt < attempts:
+                time.sleep(2)
+            else:
+                return (
+                    "The AI service is temporarily unavailable. "
+                    f"Please try again.\n\nTechnical details: {error}"
+                )
+ 
+ 
+# ============================================================
+# 6. Answer a single student question (retrieval + generation only —
+#    no chat_history side effects, so the UI can control the sequencing
+#    of "show question -> show spinner -> show answer")
+# ============================================================
+def get_answer_and_sources(question):
+    """
+    Retrieve relevant chunks and generate a grounded answer.
+    Returns (answer_text, list_of_source_lines).
+    """
+    question = (question or "").strip()
+ 
+    if not question:
+        return "", []
+ 
+    if st.session_state.retriever is None:
+        return (
+            f"The {COLLEGE_NAME} knowledge base hasn't been set up yet. "
+            "Please ask an administrator to upload the handbook and circulars first.",
+            [],
+        )
+ 
+    try:
+        relevant_docs = st.session_state.retriever.invoke(question)
+ 
+        if not relevant_docs:
+            answer = (
+                f"I don't know based on the {COLLEGE_NAME} handbook and circulars currently "
+                "available. Please check with the administration office."
+            )
+            return answer, []
+ 
+        context_parts = []
+        source_lines = []
+ 
+        for number, document in enumerate(relevant_docs, start=1):
+            source_name = document.metadata.get(
+                "source_name",
+                Path(document.metadata.get("source", "Unknown document")).name,
+            )
+            category = document.metadata.get("category", "Document")
+ 
+            # PyPDFLoader stores zero-based page numbers; TextLoader has none.
+            page_number = document.metadata.get("page")
+            readable_page = page_number + 1 if isinstance(page_number, int) else "N/A"
+ 
+            context_parts.append(
+                f"[Source {number}: {category} — {source_name}, page {readable_page}]\n"
+                f"{document.page_content}"
+            )
+            source_lines.append(f"[{category}] {source_name} — page {readable_page}")
+ 
+        context = "\n\n".join(context_parts)
+        answer = generate_answer(question, context)
+        return answer, source_lines
+ 
+    except Exception as error:
+        return f"I could not process that question. Please try again.\n\nError: {error}", []
+ 
+ 
+# ============================================================
+# 7. Build the Streamlit interface
+# ============================================================
+inject_custom_css()
+ 
+kb_ready = st.session_state.retriever is not None
+ 
+# ---------------- Sidebar: status + admin (everything non-chat lives here) ----------------
+with st.sidebar:
+    st.markdown(f"## 🎓 {COLLEGE_NAME}")
+    st.caption("AI Help Desk — Admin & Knowledge Base")
+ 
+    if kb_ready:
+        st.success("Knowledge base is ready ✅")
+    else:
+        st.warning("No knowledge base loaded yet")
+ 
+    with st.expander("📊 Knowledge base status", expanded=not kb_ready):
+        st.markdown(st.session_state.status_message)
+        if st.session_state.doc_registry:
+            st.markdown("**Documents indexed:**")
+            for entry in st.session_state.doc_registry:
+                st.markdown(f"- `[{entry['category']}]` {entry['name']} — {entry['pages']} pg")
+ 
+    st.divider()
+    st.markdown("### 🛠️ Admin: Manage Knowledge Base")
+ 
+    if ADMIN_PASSCODE and not st.session_state.admin_unlocked:
+        st.info("Enter the admin passcode to manage the knowledge base.")
+        entered = st.text_input("Admin passcode", type="password", label_visibility="collapsed",
+                                 placeholder="Admin passcode")
+        if st.button("Unlock", use_container_width=True):
+            if entered == ADMIN_PASSCODE:
+                st.session_state.admin_unlocked = True
+                st.rerun()
+            else:
+                st.error("Incorrect passcode.")
+    else:
+        with st.expander("🚀 Load ready-made demo knowledge base", expanded=not kb_ready):
+            st.caption(f"A sample {COLLEGE_NAME} handbook, circulars, and reference docs — "
+                       "try the chat before uploading real documents.")
+            if st.button("📥 Load Sample Knowledge Base", use_container_width=True):
+                load_sample_knowledge_base(append=False)
+            if st.button("➕ Add Sample Docs to Existing KB", use_container_width=True):
+                load_sample_knowledge_base(append=True)
+ 
+        with st.expander("📤 Upload your own documents"):
+            handbook_files = st.file_uploader(
+                "📘 Student Handbook", type=["pdf", "txt", "md"],
+                accept_multiple_files=True, key="handbook_uploader",
+            )
+            circular_files = st.file_uploader(
+                "📄 Circulars / Notices", type=["pdf", "txt", "md"],
+                accept_multiple_files=True, key="circular_uploader",
+            )
+            other_files = st.file_uploader(
+                "🗂️ Other (fees, rules, FAQs, etc.)", type=["pdf", "txt", "md"],
+                accept_multiple_files=True, key="other_uploader",
+            )
+ 
+            b1, b2 = st.columns(2)
+            with b1:
+                build_clicked = st.button("🔧 Build KB", type="primary", use_container_width=True)
+            with b2:
+                append_clicked = st.button("➕ Add to KB", use_container_width=True)
+ 
+            if build_clicked:
+                build_knowledge_base(handbook_files, circular_files, other_files, append=False)
+            if append_clicked:
+                build_knowledge_base(handbook_files, circular_files, other_files, append=True)
+ 
+        with st.expander("💾 Save / load / reset"):
+            if st.button("💾 Save current KB to disk", use_container_width=True):
+                save_knowledge_base()
+            if st.button("📂 Load saved KB from disk", use_container_width=True):
+                load_knowledge_base_from_disk()
+            if st.button("🗑️ Clear everything", use_container_width=True):
+                clear_session()
+                st.rerun()
+ 
+ 
+# ---------------- Main area: student chat only ----------------
+st.markdown(
+    f"""
+    <div class="nexora-header">
+        <h1>🎓 {COLLEGE_NAME} — Help Desk</h1>
+        <p>Ask about admissions, timetables, fees, or rules. Answers are grounded strictly in the
+        official handbook and circulars — nothing is made up.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+ 
+if not st.session_state.chat_history:
+    st.info(f"👋 Hi! I'm the {COLLEGE_NAME} Help Desk assistant. Ask me anything about "
+            "admissions, timetables, fees, or college rules.")
+ 
+for message in st.session_state.chat_history:
+    with st.chat_message(message["role"], avatar="🎓" if message["role"] == "assistant" else None):
+        st.markdown(message["content"])
+        sources = message.get("sources") or []
+        if message["role"] == "assistant" and sources:
+            with st.expander("📎 Sources"):
+                for line in sources:
+                    st.markdown(f"- {line}")
+ 
+# This is the LAST top-level element in the script, with nothing else
+# rendered below it at the page level — that's what keeps it pinned to
+# the bottom of the screen instead of drifting with the page content.
+question = st.chat_input(
+    "e.g. 'What is the last date to pay semester fees?'" if kb_ready
+    else "Load a knowledge base from the sidebar first…",
+    disabled=not kb_ready,
+)
+ 
+if question:
+    # Show the student's question immediately...
+    st.session_state.chat_history.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+ 
+    # ...then show a spinner while the answer is generated, and only add
+    # the assistant's bubble once it's actually ready. No st.rerun() here —
+    # that's what stops both messages from popping in at the same instant.
+    with st.chat_message("assistant", avatar="🎓"):
+        with st.spinner("Checking the handbook and circulars…"):
+            answer, sources = get_answer_and_sources(question)
+        st.markdown(answer)
+        if sources:
+            with st.expander("📎 Sources"):
+                for line in sources:
+                    st.markdown(f"- {line}")
+ 
+    st.session_state.chat_history.append(
+        {"role": "assistant", "content": answer, "sources": sources}
+    )
+ 
